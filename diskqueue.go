@@ -60,16 +60,16 @@ type diskQueue struct {
 
 	// run-time state (also persisted to disk)
 	//第一部分为diskQueue当前读写的文件的状态
-	readPos      int64 //读位置
-	writePos     int64 //写位置
-	readFileNum  int64 //读取文件编号
-	writeFileNum int64 //写入文件编号
+	readPos      int64 //表示当前应该从readFileNum这个序号的文件的readPos位置开始读取数据
+	writePos     int64 //表示当前应该从writeFileNum这个序号的文件的writePos位置开始写入数据
+	readFileNum  int64 //表示当前应该从readFileNum这个序号的文件中读取数据
+	writeFileNum int64 //表示当前应该向writeFile这个序号的文件中写入数据。
 	depth        int64 //diskQueue中当前可供读取或消费的消息的数量
 
 	sync.RWMutex
 
 	// instantiation time metadata
-	//第二部分为diskQueue的元数据信息
+	//第二部分为diskQueue的元数据信息,这部分的信息实在实例化topic和channel的时候就会被填充
 	name            string // diskQueue 名称
 	dataPath        string // 数据持久化路径
 	maxBytesPerFile int64 // 单个文件最大大小。此此属性一旦被初始化，则不可变更。
@@ -114,7 +114,7 @@ type diskQueue struct {
 func New(name string, dataPath string, maxBytesPerFile int64,
 	minMsgSize int32, maxMsgSize int32,
 	syncEvery int64, syncTimeout time.Duration, logf AppLogFunc) Interface {
-	//1.根据传入的参数构造实例
+	//1.根据传入的参数构造实例，此时传入的参数主要是diskQueue的元数据信息，即结构体中的第二部分信息
 	d := diskQueue{
 		name:              name,
 		dataPath:          dataPath,
@@ -135,12 +135,12 @@ func New(name string, dataPath string, maxBytesPerFile int64,
 
 	// no need to lock here, nothing else could possibly be touching this instance
 	//2.从配置文件中加载diskQueue的重要的属性状态，这包括readPos & writePos,readFileNum & writerFileNum和depth，
-	// 并初始化nextReadFileNum和nextReadPos两个重要的属性。
+	// 并初始化nextReadFileNum和nextReadPos两个重要的属性。即结构体中的第一部分信息。
 	err := d.retrieveMetaData()
 	if err != nil && !os.IsNotExist(err) {
 		d.logf(ERROR, "DISKQUEUE(%s) failed to retrieveMetaData - %s", d.name, err)
 	}
-	// 3. 在一个单独的 goroutien 中执行主循环
+	// 3. 主循环
 	go d.ioLoop()
 	return &d
 }
@@ -466,7 +466,7 @@ func (d *diskQueue) retrieveMetaData() error {
 	// 2. 从文件中内容初始化特定状态属性信息 readPos, writerPos, depth
 	var depth int64
 	_, err = fmt.Fscanf(f, "%d\n%d,%d\n%d,%d\n",
-		&depth,
+		&depth, ///diskQueue中当前可供读取的消息的数量
 		&d.readFileNum, &d.readPos,
 		&d.writeFileNum, &d.writePos)
 	if err != nil {
@@ -650,9 +650,9 @@ func (d *diskQueue) ioLoop() {
 	for {
 		// dont sync all the time :)
 		//同大多的存储系统类似，diskQueue采用批量刷新缓冲区的操作来提高消息写入文件系统的性能。
-		// 其中，diskQueue规定触发刷盘动作的有个条件，其中任一条件成立即可。
+		// 其中，diskQueue规定触发刷盘动作的有2个条件，其中任一条件成立即可。
 		// 一是当缓冲区中的消息的数量达到阈值(syncEvery)时，二是每隔指定时间(syncTimeout)。
-		// 需要注意的一点为在执行刷盘动作，也会重新持久化diskQueue的元数据信息。
+		// 需要注意的一点为在执行刷盘动作时，也会重新持久化diskQueue的元数据信息。
 		if count == d.syncEvery { // 1. 只有写入缓冲中的消息达到一定数量，才执行同步刷新到磁盘的操作
 			d.needSync = true
 		}
@@ -665,8 +665,10 @@ func (d *diskQueue) ioLoop() {
 			count = 0 // 重置当前等待刷盘的消息数量
 		}
 		// 3. 从文件中读取消息的逻辑
-		if (d.readFileNum < d.writeFileNum) || (d.readPos < d.writePos) {//若当前还有数据（消息）可供消费，即当前读取的文件编号 readFileNum < 目前已经写入的文件编号 writeFileNum或者当前的读取索引 readPos < 当前的写的索引 writePos），因为初始化读每一个文件时都需要重置 readPos = 0。
-			// 若二者相等，则需要通过 d.readOne 方法先更新 nextReadPos
+		if (d.readFileNum < d.writeFileNum) || (d.readPos < d.writePos) {//若磁盘还有（消息）可供读取
+			//当nextReadPos != readPos的时候，说明readChan中的消息还没被读走。不用新从文件readOnce
+			//当nextReadPos == readPos的时候，说明readChan中的消息已经被读走了，需要重新从文件readOnce一条消息
+			//因为在下面的case r <- dataRead情况下，若阻塞解除，则表示readChan中的值被读走，则接下来moveForward会使nextReadPos == readPos
 			if d.nextReadPos == d.readPos { //若当前持久化中还有未被读取或消费的消息，则调用readOne，尝试从特定的文件(readFileNum)、特定偏移位置(readPos)读取一条消息。
 				dataRead, err = d.readOne()
 				if err != nil {
